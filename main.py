@@ -241,7 +241,7 @@ async def search(query: str = Query(..., description="Search query")):
             assistant_text = ""
             citations = []
             if last_msg and last_msg.content:
-                print(last_msg)
+                print(f"Processing assistant message: {last_msg.id}")
                 for item in last_msg.content:
                     if 'text' in item and 'value' in item['text'] and item['text']['value']:
                         assistant_text += item['text']['value'] + "\n"
