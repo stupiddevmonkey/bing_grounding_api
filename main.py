@@ -1,18 +1,207 @@
-from typing import Optional
+import json
+import os
+import re
+from html import escape
+from pathlib import Path
+from typing import Annotated, Literal
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, Query, Request, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import time
 
 from azure.ai.projects import AIProjectClient
+from azure.ai.agents import AgentsClient
 from azure.ai.agents.models import BingGroundingTool
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 
 load_dotenv()
+
+CITATION_PATTERN = re.compile(r"【\d+:\d+†source】")
+FILTER_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "domain-filters.json"
+FilterMode = Literal["whitelist", "blacklist"]
+PUBLIC_RESULT_FIELDS = {
+    "query",
+    "agent_id",
+    "thread_id",
+    "run_id",
+    "run_status",
+    "status",
+    "error",
+    "assistant_response",
+    "citations",
+}
+
+
+def normalize_domain(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Domain entries must be non-empty strings.")
+
+    candidate = value.strip().lower()
+    if "://" not in candidate and any(character in candidate for character in "/?#"):
+        raise ValueError(f"Invalid domain entry: {value}")
+
+    parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if not hostname or "*" in hostname:
+        raise ValueError(f"Invalid domain entry: {value}")
+    return hostname
+
+
+def load_domain_filters(path: Path = FILTER_CONFIG_PATH) -> dict[str, list[str]]:
+    with path.open(encoding="utf-8") as config_file:
+        config = json.load(config_file)
+
+    if (
+        not isinstance(config, dict)
+        or not isinstance(config.get("whitelist"), list)
+        or not isinstance(config.get("blacklist"), list)
+    ):
+        raise ValueError(
+            'Domain filter configuration must contain "whitelist" and "blacklist" arrays.'
+        )
+
+    return {
+        "whitelist": list(dict.fromkeys(
+            normalize_domain(domain) for domain in config["whitelist"]
+        )),
+        "blacklist": list(dict.fromkeys(
+            normalize_domain(domain) for domain in config["blacklist"]
+        )),
+    }
+
+
+def domain_matches(hostname: str, configured_domain: str) -> bool:
+    normalized_hostname = hostname.rstrip(".").lower()
+    return (
+        normalized_hostname == configured_domain
+        or normalized_hostname.endswith(f".{configured_domain}")
+    )
+
+
+def citation_is_allowed(url: str, domains: list[str], mode: FilterMode) -> bool:
+    if not domains:
+        return True
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"Invalid citation URL: {url}")
+
+    matches = any(
+        domain_matches(parsed.hostname, domain)
+        for domain in domains
+    )
+    return matches if mode == "whitelist" else not matches
+
+
+def segment_sentences(summary: str) -> list[str]:
+    segments = re.findall(
+        r""".*?(?:[.!?]+(?:["')\]]+)?(?=\s|$)|\n+|$)""",
+        summary,
+        flags=re.DOTALL,
+    )
+    return [segment for segment in segments if segment]
+
+
+def filter_search_result(
+    search_result: dict,
+    mode: FilterMode,
+    config: dict[str, list[str]] | None = None,
+) -> dict:
+    if mode not in {"whitelist", "blacklist"}:
+        raise ValueError(f"Unsupported filter mode: {mode}")
+
+    filtered_result = {
+        key: value
+        for key, value in search_result.items()
+        if key in PUBLIC_RESULT_FIELDS
+    }
+    filtered_result["filter_mode"] = mode
+
+    summary = filtered_result.get("assistant_response")
+    citations = filtered_result.get("citations")
+    if not isinstance(summary, str) or not isinstance(citations, list):
+        return filtered_result
+
+    domain_config = config if config is not None else load_domain_filters()
+    domains = domain_config[mode]
+    filtered_result["configured_domain_count"] = len(domains)
+    marker_to_citation = {}
+    citation_index = 0
+    for marker in CITATION_PATTERN.findall(summary):
+        if marker not in marker_to_citation:
+            if citation_index >= len(citations):
+                raise ValueError(f"No citation metadata was found for marker {marker}.")
+            marker_to_citation[marker] = citations[citation_index]
+            citation_index += 1
+
+    if not marker_to_citation and citations and domains:
+        allowed_citations = [
+            citation
+            for citation in citations
+            if citation_is_allowed(citation.get("url", ""), domains, mode)
+        ]
+        if len(allowed_citations) != len(citations):
+            filtered_result["assistant_response"] = ""
+            filtered_result["citations"] = []
+            filtered_result["removed_sentence_count"] = 1
+            return filtered_result
+
+    retained_citations = {}
+    retained_sentences = []
+    removed_sentence_count = 0
+    for sentence in segment_sentences(summary):
+        markers = CITATION_PATTERN.findall(sentence)
+        rejected = any(
+            not citation_is_allowed(
+                marker_to_citation[marker].get("url", ""),
+                domains,
+                mode,
+            )
+            for marker in markers
+        )
+        if rejected:
+            removed_sentence_count += 1
+            continue
+
+        retained_sentences.append(sentence)
+        for marker in markers:
+            retained_citations.setdefault(marker, marker_to_citation[marker])
+
+    filtered_result["assistant_response"] = "".join(retained_sentences).strip()
+    filtered_result["citations"] = list(retained_citations.values())
+    filtered_result["removed_sentence_count"] = removed_sentence_count
+    return filtered_result
+
+
+def format_result_for_display(search_result: dict) -> dict:
+    summary = search_result.get("assistant_response") or ""
+    citations = search_result.get("citations", [])
+    formatted_response = escape(summary)
+    seen_citations = {}
+
+    for marker in CITATION_PATTERN.findall(formatted_response):
+        if marker not in seen_citations:
+            seen_citations[marker] = len(seen_citations) + 1
+
+    for marker, number in seen_citations.items():
+        if number <= len(citations):
+            citation_url = escape(citations[number - 1]["url"], quote=True)
+            replacement = (
+                f'<sup><a href="{citation_url}" target="_blank" '
+                f'rel="noopener noreferrer" class="citation-link">[{number}]</a></sup>'
+            )
+            formatted_response = formatted_response.replace(marker, replacement)
+
+    return {
+        "summary": formatted_response,
+        "citations": citations,
+        "removed_sentence_count": search_result.get("removed_sentence_count", 0),
+        "configured_domain_count": search_result.get("configured_domain_count", 0),
+    }
+
 
 # Create the FastAPI application with optional metadata
 app = FastAPI(
@@ -36,25 +225,45 @@ app.add_middleware(
 # Home page: GET shows form, POST processes search
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request, "results": None, "raw_json": None, "query": ""})
+    return templates.TemplateResponse(request, "index.html", {
+        "request": request,
+        "unfiltered_results": None,
+        "filtered_results": None,
+        "raw_json": None,
+        "query": "",
+        "filter_mode": "whitelist",
+    })
 
 @app.post("/", response_class=HTMLResponse)
-async def home_post(request: Request, query: str = Form(...)):
-    # Call the search logic
-    search_result = await search(query)
+async def home_post(
+    request: Request,
+    query: str = Form(...),
+    use_blacklist: bool = Form(False),
+):
+    filter_mode: FilterMode = "blacklist" if use_blacklist else "whitelist"
+    unfiltered_result = await run_agent_search(query)
+    search_result = filter_search_result(unfiltered_result, filter_mode)
+    search_result = {
+        key: value
+        for key, value in search_result.items()
+        if key in PUBLIC_RESULT_FIELDS
+        or key in {
+            "filter_mode",
+            "removed_sentence_count",
+            "configured_domain_count",
+        }
+    }
     # Parse results for display
     results = []
     raw_json = None
     formatted_response = ""
     citations_list = []
-    
     if isinstance(search_result, dict):
-        import json, re
-        summary = search_result.get("assistant_response", "")
+        summary = search_result.get("assistant_response") or ""
         citations_list = search_result.get("citations", [])
         
         # Format the response with citation exponents (only for display)
-        formatted_response = summary
+        formatted_response = escape(summary)
         if citations_list:
             # Replace Azure citation markers like 【3:0†source】 with clickable superscripts
             # Pattern matches 【number:number†source】
@@ -75,35 +284,51 @@ async def home_post(request: Request, query: str = Form(...)):
             for marker, num in seen_citations.items():
                 if num <= len(citations_list):
                     citation = citations_list[num - 1]
-                    replacement = f'<sup><a href="{citation["url"]}" target="_blank" class="citation-link">[{num}]</a></sup>'
+                    citation_url = escape(citation["url"], quote=True)
+                    replacement = (
+                        f'<sup><a href="{citation_url}" target="_blank" '
+                        f'rel="noopener noreferrer" class="citation-link">[{num}]</a></sup>'
+                    )
                     formatted_response = formatted_response.replace(marker, replacement)
         
         results = {
             "summary": formatted_response,
-            "citations": citations_list
+            "citations": citations_list,
+            "removed_sentence_count": search_result.get("removed_sentence_count", 0),
+            "configured_domain_count": search_result.get(
+                "configured_domain_count",
+                0,
+            ),
         }
-        # Keep raw JSON exactly as returned from API
-        # Convert the raw_message object to a dict representation
-        raw_message = search_result.get("raw_message")
-        if raw_message:
-            # Try to convert Azure SDK object to dict
-            if hasattr(raw_message, 'as_dict'):
-                raw_json = json.dumps(raw_message.as_dict(), indent=2, default=str)
-            else:
-                # The raw_message is the actual message dict we want to display
-                raw_json = json.dumps(raw_message, indent=2, default=str)
-        else:
-            # Fallback to original search_result
-            raw_json = json.dumps(search_result, indent=2, default=str)
+        raw_payload = unfiltered_result.get("raw_message", unfiltered_result)
+        raw_json = json.dumps(raw_payload, indent=2, default=str)
     
-    return templates.TemplateResponse("index.html", {"request": request, "results": results, "raw_json": raw_json, "query": query})
+    return templates.TemplateResponse(request, "index.html", {
+        "request": request,
+        "unfiltered_results": format_result_for_display(unfiltered_result),
+        "filtered_results": results,
+        "raw_json": raw_json,
+        "query": query,
+        "filter_mode": filter_mode,
+    })
 
 
 @app.get("/search", summary="Search Endpoint", description="Accepts a query string and returns search results.")
-async def search(query: str = Query(..., description="Search query")):
+async def search(
+    query: Annotated[str, Query(description="Search query")],
+    filter_mode: Annotated[
+        FilterMode,
+        Query(description="Domain filter mode"),
+    ] = "whitelist",
+):
+    raw_result = await run_agent_search(query)
+    return filter_search_result(raw_result, filter_mode)
+
+
+async def run_agent_search(query: str) -> dict:
 
     """
-    Search endpoint that accepts a query string and returns search results.
+    Run the Bing-grounded agent and return its unfiltered server-side result.
     
     Args:
         query (str): The search query provided by the user.
@@ -147,7 +372,10 @@ async def search(query: str = Query(..., description="Search query")):
         )  
         print("Azure AI Project Client initialized.")  
   
-        with project_client:
+        with project_client, AgentsClient(
+            endpoint=project_conn_str,
+            credential=credential
+        ) as agents_client:
             print("Step 2: Enabling Bing Grounding Tool...")
             bing_connection = project_client.connections.get(bing_connection_name)
             bing_tool = BingGroundingTool(connection_id=bing_connection.id)
@@ -165,7 +393,7 @@ async def search(query: str = Query(..., description="Search query")):
             # final_instructions = enforced_instructions
 
             # Look for existing agent only if its instructions match our pattern; else recreate
-            agents_list = list(project_client.agents.list_agents())
+            agents_list = list(agents_client.list_agents())
             agent = next((a for a in agents_list if a.name == agent_name), None)
             # if agent:
             #     # If existing agent has old, generic instructions, recreate
@@ -174,7 +402,7 @@ async def search(query: str = Query(..., description="Search query")):
             #         agent = None
 
             if agent is None:
-                agent = project_client.agents.create_agent(
+                agent = agents_client.create_agent(
                     model=agent_llm,
                     name=agent_name,
                     instructions=agent_instructions,
@@ -185,12 +413,12 @@ async def search(query: str = Query(..., description="Search query")):
             print(f"Using agent ID: {agent.id}")
 
             # Step 4: Create thread
-            thread = project_client.agents.threads.create()
+            thread = agents_client.threads.create()
             print(f"Thread ID: {thread.id}")
 
             # Step 5: Add user message - prepend directive to emphasize action
             print("Step 5: Adding user message to the thread...")
-            user_message = project_client.agents.messages.create(
+            user_message = agents_client.messages.create(
                 thread_id=thread.id,
                 role="user",
                 content=query
@@ -198,7 +426,7 @@ async def search(query: str = Query(..., description="Search query")):
             print(f"User message ID: {user_message.id}")
 
             # Step 6: Run agent (simple wait)
-            run = project_client.agents.runs.create_and_process(thread_id=thread.id, agent_id=agent.id, tool_choice={"type": "bing_grounding"})
+            run = agents_client.runs.create_and_process(thread_id=thread.id, agent_id=agent.id, tool_choice={"type": "bing_grounding"})
             print(f"Run finished with status: {run.status}")
 
             #wait_seconds = 7  # Slightly longer to allow tool call
@@ -207,7 +435,7 @@ async def search(query: str = Query(..., description="Search query")):
 
             # Optional refresh
             # try:
-            #     run = project_client.agents.runs.get(thread_id=thread.id, run_id=run.id)
+            #     run = agents_client.runs.get(thread_id=thread.id, run_id=run.id)
             #     print(f"Run status after wait: {run.status}")
             # except Exception as e:
             #     print(f"Run refresh failed: {e}")
@@ -220,7 +448,7 @@ async def search(query: str = Query(..., description="Search query")):
                 }
 
             # Step 7: Collect messages
-            messages_list = list(project_client.agents.messages.list(thread_id=thread.id))
+            messages_list = list(agents_client.messages.list(thread_id=thread.id))
 
             # # Debug: Extract any tool call blocks
             # tool_calls_debug = []
@@ -263,16 +491,15 @@ async def search(query: str = Query(..., description="Search query")):
             if not assistant_text:
                 print("Assistant produced no factual content; may need longer wait or instructions tweak.")
 
-            # Convert last_msg to dict for JSON serialization
-            raw_message_dict = None
+            raw_message = None
             if last_msg:
-                if hasattr(last_msg, 'as_dict'):
-                    raw_message_dict = last_msg.as_dict()
-                elif hasattr(last_msg, '__dict__'):
-                    raw_message_dict = last_msg.__dict__
+                if hasattr(last_msg, "as_dict"):
+                    raw_message = last_msg.as_dict()
+                elif hasattr(last_msg, "__dict__"):
+                    raw_message = last_msg.__dict__
                 else:
-                    raw_message_dict = {"message": str(last_msg)}
-            
+                    raw_message = {"message": str(last_msg)}
+
             return {
                 "query": query,
                 "agent_id": agent.id,
@@ -281,7 +508,7 @@ async def search(query: str = Query(..., description="Search query")):
                 "run_status": getattr(run, "status", None),
                 "assistant_response": assistant_text or None,
                 "citations": citations,
-                "raw_message": raw_message_dict
+                "raw_message": raw_message,
             }
     except Exception as e:  
         print(f"An error occurred: {e}")

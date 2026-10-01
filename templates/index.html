@@ -2,16 +2,29 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Bing Grounding Demo</title>
     <style>
         body { font-family: Arial, sans-serif; background: #f4f6fa; margin: 0; padding: 0; }
-        .container { max-width: 700px; margin: 40px auto; background: #fff; padding: 32px 40px 40px 40px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+        .container { max-width: 1800px; margin: 40px auto; background: #fff; padding: 32px 40px 40px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
         h1 { text-align: center; color: #2d3b4f; }
-        .search-box { display: flex; justify-content: center; margin-bottom: 32px; }
+        .search-box { margin-bottom: 32px; }
+        .search-row { display: flex; justify-content: center; }
         input[type="text"] { width: 80%; padding: 12px; font-size: 1.2em; border: 1px solid #cfd8dc; border-radius: 6px 0 0 6px; outline: none; }
         button { padding: 12px 24px; font-size: 1.2em; background: #0078d4; color: #fff; border: none; border-radius: 0 6px 6px 0; cursor: pointer; }
         button:hover { background: #005fa3; }
-        .results { margin-top: 24px; }
+        .filter-controls { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 16px; color: #2d3b4f; }
+        .switch { position: relative; display: inline-block; width: 52px; height: 28px; }
+        .switch input { width: 0; height: 0; opacity: 0; }
+        .slider { position: absolute; inset: 0; background: #0078d4; border-radius: 28px; cursor: pointer; transition: background 0.2s; }
+        .slider::before { content: ""; position: absolute; width: 20px; height: 20px; left: 4px; bottom: 4px; background: #fff; border-radius: 50%; transition: transform 0.2s; }
+        .switch input:checked + .slider { background: #5c2d91; }
+        .switch input:checked + .slider::before { transform: translateX(24px); }
+        .switch input:focus-visible + .slider { outline: 3px solid #ffb900; outline-offset: 2px; }
+        .panels { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; align-items: start; }
+        .panel { min-width: 0; }
+        .panel h3 { margin-top: 0; color: #2d3b4f; }
+        .results { margin: 0; }
         .result { background: #e9f1fb; border-radius: 8px; margin-bottom: 18px; padding: 18px 22px; }
         .result-title { font-size: 1.15em; font-weight: bold; color: #0078d4; text-decoration: none; }
         .result-summary { margin-top: 8px; color: #2d3b4f; line-height: 1.6; }
@@ -21,42 +34,91 @@
         .citations-title { font-weight: bold; margin-bottom: 12px; color: #2d3b4f; }
         .citation-item { margin-bottom: 8px; }
         .citation-number { color: #0078d4; font-weight: bold; margin-right: 8px; }
-        .json-area { background: #23272e; color: #e6e6e6; font-family: 'Fira Mono', 'Consolas', monospace; padding: 18px; border-radius: 8px; margin-top: 32px; overflow-x: auto; font-size: 0.98em; }
-        .json-area pre { margin: 0; }
+        .filter-status { margin-top: 14px; color: #52616b; font-size: 0.9em; }
+        .json-area { background: #23272e; color: #e6e6e6; font-family: 'Fira Mono', 'Consolas', monospace; padding: 18px; border-radius: 8px; overflow: auto; font-size: 0.98em; max-height: 70vh; }
+        .json-area pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+        @media (max-width: 1100px) {
+            .container { margin: 20px; padding: 24px; }
+            .panels { grid-template-columns: 1fr; }
+            .json-area { max-height: 420px; }
+        }
+        @media (max-width: 600px) {
+            .container { margin: 0; padding: 20px 14px; border-radius: 0; }
+            .search-row { flex-direction: column; }
+            input[type="text"] { box-sizing: border-box; width: 100%; border-radius: 6px 6px 0 0; }
+            button { border-radius: 0 0 6px 6px; }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Bing Grounding Demo</h1>
         <form class="search-box" method="post" action="/">
-            <input type="text" name="query" placeholder="Enter your search query..." required value="{{ query|default('') }}">
-            <button type="submit">Search</button>
-        </form>
-        {% if results %}
-        <h2>Search Results</h2>
-        <h3>Beautified Response</h3>
-        <div class="results">
-            <div class="result">
-                <div class="result-summary">{{ results.summary|safe }}</div>
-                {% if results.citations %}
-                <div class="citations-section">
-                    <div class="citations-title">Sources:</div>
-                    <div class="citation-item"><a href="https://www.bing.com/search?q={{ query }}" target="_blank" class="result-title">{{ query }}</a></div>
-                    {% for citation in results.citations %}
-                    <div class="citation-item">
-                        <span class="citation-number">[{{ loop.index }}]</span>
-                        <a href="{{ citation.url }}" target="_blank" class="result-title">{{ citation.title }}</a>
-                    </div>
-                    {% endfor %}
-                </div>
-                {% endif %}
+            <div class="search-row">
+                <input type="text" name="query" placeholder="Enter your search query..." required value="{{ query|default('') }}">
+                <button type="submit">Search</button>
             </div>
-        </div>
-        {% endif %}
-        {% if raw_json %}
-        <h3>Raw JSON Response</h3>
-        <div class="json-area">
-            <pre>{{ raw_json }}</pre>
+            <div class="filter-controls">
+                <span>Whitelist</span>
+                <label class="switch">
+                    <input name="use_blacklist" type="checkbox" role="switch" aria-label="Use blacklist filtering" {% if filter_mode == "blacklist" %}checked{% endif %}>
+                    <span class="slider"></span>
+                </label>
+                <span>Blacklist</span>
+            </div>
+        </form>
+        {% if unfiltered_results %}
+        <h2>Search Results</h2>
+        <div class="panels">
+            <section class="panel">
+                <h3>Unfiltered Raw JSON</h3>
+                <div class="json-area">
+                    <pre>{{ raw_json }}</pre>
+                </div>
+            </section>
+            <section class="panel">
+                <h3>Unfiltered Formatted Results</h3>
+                <div class="results">
+                    <div class="result">
+                        <div class="result-summary">{{ unfiltered_results.summary|safe }}</div>
+                        {% if unfiltered_results.citations %}
+                        <div class="citations-section">
+                            <div class="citations-title">Sources:</div>
+                            <div class="citation-item"><a href="https://www.bing.com/search?q={{ query }}" target="_blank" rel="noopener noreferrer" class="result-title">{{ query }}</a></div>
+                            {% for citation in unfiltered_results.citations %}
+                            <div class="citation-item">
+                                <span class="citation-number">[{{ loop.index }}]</span>
+                                <a href="{{ citation.url }}" target="_blank" rel="noopener noreferrer" class="result-title">{{ citation.title }}</a>
+                            </div>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </section>
+            <section class="panel">
+                <h3>{{ filter_mode|capitalize }} Filtered Formatted Results</h3>
+                <div class="results">
+                    <div class="result">
+                        <div class="result-summary">{{ filtered_results.summary|safe }}</div>
+                        {% if filtered_results.citations %}
+                        <div class="citations-section">
+                            <div class="citations-title">Sources:</div>
+                            {% for citation in filtered_results.citations %}
+                            <div class="citation-item">
+                                <span class="citation-number">[{{ loop.index }}]</span>
+                                <a href="{{ citation.url }}" target="_blank" rel="noopener noreferrer" class="result-title">{{ citation.title }}</a>
+                            </div>
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                        <div class="filter-status">
+                            {{ filtered_results.removed_sentence_count }} cited sentence(s) removed server-side
+                            using {{ filtered_results.configured_domain_count }} {{ filter_mode }} domain(s).
+                        </div>
+                    </div>
+                </div>
+            </section>
         </div>
         {% endif %}
     </div>

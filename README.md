@@ -46,6 +46,42 @@ Example response:
 -   **Search Endpoint:** Accepts a query string and returns search results using Bing Grounding.
 -   **Azure AI Integration:** Utilizes Azure AI Project Client for agent creation, thread management, and message processing.
 -   **Bing Grounding:** Enhances search accuracy by grounding the agent with Bing search results.
+-   **Server-Side Domain Filtering:** Creates a filtered result after the agent responds while preserving unfiltered comparison panels in the web UI.
+
+## Domain filtering
+
+Filtering runs in the FastAPI application immediately after the Bing agent responds. The web UI then displays three side-by-side panels on wide screens:
+
+1. The unfiltered raw agent JSON.
+2. The styled unfiltered response.
+3. The styled server-filtered response.
+
+The `/search` API returns the filtered result only. The unfiltered data is retained for the web request solely to render the two comparison panels.
+
+Use the toggle below the search box to select whitelist or blacklist mode before submitting a search. Whitelist mode is selected when the page first loads. The `/search` API accepts `filter_mode=whitelist` or `filter_mode=blacklist` and defaults to whitelist.
+
+Configure the server-only domain lists in `config/domain-filters.json`:
+
+```json
+{
+  "whitelist": [
+    "microsoft.com"
+  ],
+  "blacklist": [
+    "blocked.example"
+  ]
+}
+```
+
+Only the active array is used. A configured domain matches both its exact hostname and its subdomains, so `example.com` also matches `news.example.com` but does not match `notexample.com`. Matching is case-insensitive.
+
+- In whitelist mode, a sentence is removed when it cites a domain that is not in the whitelist.
+- In blacklist mode, a sentence is removed when it cites a domain in the blacklist.
+- If a sentence contains both accepted and rejected citations, the entire sentence is removed.
+- Uncited sentences remain in the filtered response.
+- If the active array is empty, filtering is disabled and all content remains visible.
+
+The filtered source list contains only sources cited by retained sentences and renumbers them in order of appearance. If citation metadata cannot be safely associated with the response text, the server fails closed rather than returning potentially disallowed content.
 
 ## Prerequisites
 
